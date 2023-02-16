@@ -1,0 +1,184 @@
+-- Declare query variables
+DECLARE startDate DEFAULT "20230201";
+DECLARE endDate DEFAULT "20230201";
+DECLARE pageType DEFAULT ["page_view"];
+DECLARE firstHit DEFAULT FALSE;
+DECLARE lastHit DEFAULT TRUE;
+DECLARE deviceCategories DEFAULT ["desktop", "mobile", "tablet"];
+DECLARE deviceAll DEFAULT FALSE;
+DECLARE flagEvents DEFAULT FALSE;
+DECLARE truncatedSearches DEFAULT TRUE;
+DECLARE desiredPage DEFAULT "www.gov.uk/trade-tariff";
+DECLARE queryString DEFAULT TRUE;
+DECLARE desiredPageRemoveRefreshes DEFAULT TRUE;
+DECLARE numberOfStages DEFAULT 3;
+DECLARE entrancePage DEFAULT TRUE;
+DECLARE exitPage DEFAULT TRUE;
+
+WITH get_session_data AS (
+SELECT unique_session_id,
+ROW_NUMBER() OVER (PARTITION BY unique_session_id ORDER BY event_timestamp ASC, event_name ASC) AS journeyNumber,
+ROW_NUMBER() OVER (PARTITION BY unique_session_id ORDER BY event_timestamp DESC, event_name DESC) AS revJourneyNumber,
+event_name,
+category as deviceCategory,
+cleaned_page_location as pagePath,
+hostname,
+traffic_source_source,
+CONCAT(cleaned_page_location) AS pageId
+FROM `ga4-analytics-352613.flattened_dataset.flattened_daily_ga_data_*` 
+WHERE
+ _TABLE_SUFFIX BETWEEN startDate AND endDate
+AND event_name IN UNNEST(pageType)
+AND (CASE WHEN deviceAll THEN category IN UNNEST(["mobile", "desktop", "tablet"]) END
+OR CASE WHEN deviceCategories IS NOT NULL THEN category IN UNNEST(deviceCategories) END)
+)
+
+,combine_host_with_pageids AS (
+    -- Combine hostname with pageId
+SELECT * EXCEPT (hostname) REPLACE (IF(STARTS_WITH(pagePath, '/search/'), CONCAT(hostname, ': ', pageId), CONCAT(hostname, pageId)) AS pageId)
+FROM get_session_data
+)
+
+,
+    get_search_content_type_and_keywords AS (
+        -- Extract the content type and keywords (if any) for GOV.UK search pages.
+        SELECT
+            *,
+            IFNULL(
+              REGEXP_EXTRACT(pagePath, r"^/search/([^ ?#/]+)"),
+              REGEXP_EXTRACT(pagePath, r"^.+ - ([^-]+) - GOV.UK$")
+            ) AS searchContentType,
+            IFNULL(
+              REPLACE(REGEXP_EXTRACT(pagePath, r"^/search/[^ ?#/]+\?keywords=([^&]+)"), "+", " "),
+              REGEXP_EXTRACT(pagePath, r"^(.+)- [^-]+ - GOV.UK$")
+            ) AS searchKeywords
+        FROM combine_host_with_pageids
+    )
+    
+    ,
+    compile_search_entry AS (
+        -- Truncate the search page into an entry of the search content type and keywords (if any).
+        SELECT
+            * EXCEPT (searchContentType, searchKeywords),
+            CONCAT(
+                "Sitesearch (",
+                searchContentType,
+                "):",
+                COALESCE(searchKeywords, "none")
+            ) AS search_entry
+        FROM get_search_content_type_and_keywords
+    )
+    ,
+    replace_escape_characters AS (
+       -- Replace \ with / as otherwise following REGEXP_REPLACE will not execute
+       SELECT
+          *,
+          REGEXP_REPLACE(search_entry, r"\\", "/") AS searchEntryEscapeRemoved
+       FROM compile_search_entry
+    )
+    ,
+    revise_search_pageids AS (
+        -- Replace `pageId` for search pages with the compiled entries if selected by the user.
+        SELECT
+            * REPLACE (
+                IFNULL(IF(truncatedSearches, (REGEXP_REPLACE(pageId, r"^/search/.*", searchEntryEscapeRemoved)), pageId), pageId) AS pageId
+            )
+        FROM replace_escape_characters
+    )
+    ,
+    identify_page_refreshes AS (
+        -- Lag the page `type` and `pageId` columns. This helps identify page refreshes that can be removed in the
+        -- next CTE
+        SELECT
+            *,
+            LAG(event_name) OVER (PARTITION BY unique_session_id ORDER BY journeyNumber) AS lagType,
+            LAG(pageId) OVER (PARTITION BY unique_session_id ORDER BY journeyNumber) AS lagPageId
+        FROM revise_search_pageids
+    )
+    ,
+    identify_hit_to_desired_page AS (
+        -- Get the first/last hit to the desired page. Ignores previous visits to the desirted page. Page refreshes of the
+        -- desired page are also ignored if the correct option is declared.
+        SELECT
+            unique_session_id,
+            deviceCategory,traffic_source_source,
+            CASE
+                WHEN firstHit THEN MIN(journeyNumber)
+                WHEN lastHit THEN MAX(journeyNumber)
+            END AS desiredPageJourneyNumber
+        FROM identify_page_refreshes
+        WHERE pageId = desiredPage
+        AND IF(
+            desiredPageRemoveRefreshes,
+            (
+                lagPageId IS NULL
+                OR pageId != lagPageId
+                OR IF(ARRAY_LENGTH(pageType) > 1, pageId = lagPageId AND event_name != lagType, FALSE)
+            ),
+            TRUE
+        )
+        GROUP BY unique_session_id, deviceCategory,traffic_source_source
+    )
+    ,
+    subset_journey_to_hit_of_desired_page AS (
+        -- Subset all user journeys to the first/last hit of the desired page.
+        SELECT revise_search_pageids.*
+        FROM revise_search_pageids
+        INNER JOIN identify_hit_to_desired_page
+        ON revise_search_pageids.unique_session_id = identify_hit_to_desired_page.unique_session_id
+        AND revise_search_pageids.deviceCategory = identify_hit_to_desired_page.deviceCategory
+        AND revise_search_pageids.journeyNumber <= identify_hit_to_desired_page.desiredPageJourneyNumber
+    ),
+    calculate_stages AS (
+        -- Calculate the number of stages from the first/last hit to the desired page, where the first/last hit to the desired
+        -- page is '1'.
+        SELECT
+            *,
+            ROW_NUMBER() OVER (PARTITION BY unique_session_id ORDER BY journeyNumber DESC) AS reverseDesiredPageJourneyNumber
+        FROM subset_journey_to_hit_of_desired_page
+    ),
+    subset_journey_to_number_of_stages AS (
+        -- Compile the subsetted user journeys together for each session in reverse order (first/last hit to the desired
+        -- page first), delimited by " <<< ".
+        SELECT DISTINCT
+            unique_session_id,
+            deviceCategory,traffic_source_source,
+            MIN(journeyNumber) OVER (PARTITION BY unique_session_id) = 1 AS flagEntrance,
+            MIN(revJourneyNumber) OVER (PARTITION BY unique_session_id) = 1 AS flagExit,
+            STRING_AGG(pageId, " <<< ") OVER (
+                PARTITION BY unique_session_id
+                ORDER BY reverseDesiredPageJourneyNumber ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+            ) AS userJourney
+        FROM calculate_stages
+        WHERE reverseDesiredPageJourneyNumber <= numberOfStages
+    )
+
+    ,count_distinct_journeys AS (
+        -- Count the number of sessions for each distinct subsetted user journey, split by whether the sessions
+        -- entered on the first page of the subsetted journey or not
+        SELECT
+            CASE WHEN entrancePage
+                   THEN CAST(flagEntrance AS STRING)
+                   ELSE 'no flag'
+            END AS flagEntrance,
+            CASE WHEN exitPage
+                   THEN CAST(flagExit AS STRING)
+                   ELSE 'no flag'
+            END AS flagExit,
+            CASE WHEN deviceAll
+                   THEN CAST(deviceCategory AS STRING)
+                   ELSE ARRAY_TO_STRING(deviceCategories, ", ")
+            END AS deviceCategory,
+            userJourney,
+--            traffic_source_source,
+            (SELECT COUNT(unique_session_id) FROM subset_journey_to_number_of_stages) AS totalSessions,
+            COUNT(unique_session_id) AS countSessions
+        FROM subset_journey_to_number_of_stages
+        GROUP BY
+            flagEntrance, flagExit, deviceCategory, userJourney--, traffic_source_source
+    )
+SELECT
+    *,
+    countSessions / totalSessions AS proportionSessions
+FROM count_distinct_journeys
+ORDER BY countSessions DESC;
